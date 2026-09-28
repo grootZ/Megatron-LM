@@ -357,6 +357,36 @@ def _all_to_all_hp2cp(
     return output
 
 
+_THD_TE_DEFAULT_SHARED_BYTES = 48 * 1024
+
+
+def _thd_partitioned_indices(
+    cu_seqlens: torch.Tensor, total_tokens: int, cp_size: int, cp_rank: int
+) -> torch.Tensor:
+    """Match TE's THD zigzag indices without its whole-cu shared-memory limit.
+
+    TE 2.10 stages every ``cu_seqlens`` entry in dynamic shared memory but
+    does not opt in above 48 KiB. Keep TE for smaller layouts; search document
+    boundaries on the input device when that launch would exceed the limit.
+    """
+    if cu_seqlens.numel() * cu_seqlens.element_size() <= _THD_TE_DEFAULT_SHARED_BYTES:
+        return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+
+    assert cu_seqlens.dtype == torch.int32 and cu_seqlens.ndim == 1
+    assert total_tokens % (2 * cp_size) == 0 and 0 <= cp_rank < cp_size
+    # Every physical document is divisible by 2*cp_size. The scaled cu table
+    # partitions each rank's [total_tokens/cp_size] logical output positions.
+    scaled_cu = torch.div(cu_seqlens, cp_size, rounding_mode="floor").contiguous()
+    token_ids = torch.arange(total_tokens // cp_size, dtype=torch.int32, device=cu_seqlens.device)
+    doc_ids = torch.searchsorted(scaled_cu, token_ids, right=True, out_int32=True) - 1
+    starts = scaled_cu.index_select(0, doc_ids)
+    ends = scaled_cu.index_select(0, doc_ids + 1)
+    relative = token_ids - starts
+    half = (ends - starts) // 2
+    offset = torch.where(relative < half, cp_rank, 2 * (cp_size - 1) - cp_rank)
+    return (starts * cp_size + relative + half * offset).to(torch.int32)
+
+
 def _undo_attention_load_balancing(
     input_: torch.Tensor, cp_size: int, packed_seq_params: Optional[PackedSeqParams] = None
 ) -> torch.Tensor:
@@ -390,7 +420,7 @@ def _undo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            index = _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             output[index] = input_[start:end]
         return output
 
@@ -428,7 +458,89 @@ def _redo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index[start:end] = tex.thd_get_partitioned_indices(
-                cu_seqlens, total_tokens, cp_size, cp_rank
-            )
+            index[start:end] = _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
         return input_.index_select(0, index)
+
+
+def reconstruct_tensor_cp(
+    tensor: torch.Tensor,
+    packed_seq_params: Optional[PackedSeqParams] = None,
+    dim: int = 0,
+    differentiable: bool = False,
+) -> torch.Tensor:
+    """All-gather a context-parallel-sharded tensor and undo the zigzag load balancing.
+
+    Every CP rank ends up with the full sequence in true causal (sequential) order, so
+    modules that need global context — the QSA indexer block selection and the PLE n-gram
+    hashing plus its causal dilated conv — can run on the gathered tensor exactly as in the
+    CP=1 case. The local rank's own slice is re-pinned into the gathered buffer so the local
+    autograd graph is preserved by default. Attention must pass ``differentiable=True``:
+    its local queries attend to remote keys/values, whose gradients must be summed across
+    ranks in the gather's reduce-scatter backward.
+    """
+    from megatron.core import parallel_state
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_group = parallel_state.get_context_parallel_group()
+    cp_rank = parallel_state.get_context_parallel_rank()
+
+    need_transpose = dim != 0
+    if need_transpose:
+        tensor = tensor.transpose(0, dim).contiguous()
+
+    tensor = tensor.contiguous()
+    if differentiable:
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+        gathered = gather_from_sequence_parallel_region(
+            tensor, tensor_parallel_output_grad=True, group=cp_group
+        )
+    else:
+        output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(output_list, tensor, group=cp_group)
+        # Preserve the local autograd graph for existing replicated computations.
+        output_list[cp_rank] = tensor
+        gathered = torch.cat(output_list, dim=0)
+
+    gathered = _undo_attention_load_balancing(gathered, cp_size, packed_seq_params)
+
+    if need_transpose:
+        gathered = gathered.transpose(0, dim).contiguous()
+    return gathered
+
+
+def split_tensor_cp(
+    tensor: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None, dim: int = 0
+) -> torch.Tensor:
+    """Inverse of :func:`reconstruct_tensor_cp`: redo the zigzag load balancing and return
+    this CP rank's local slice.
+
+    Used to split a full-sequence output — produced on the gathered tensor — back into the
+    CP-local zigzag form the rest of the model expects. No collective is needed: every rank
+    already holds the full tensor from a preceding ``reconstruct_tensor_cp``, so this is a
+    local reorder followed by a slice. The slice preserves the autograd graph for the local
+    rows, routing their gradient back through the sequential full tensor to the local slot.
+    """
+    from megatron.core import parallel_state
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size <= 1:
+        return tensor
+
+    cp_rank = parallel_state.get_context_parallel_rank()
+
+    need_transpose = dim != 0
+    if need_transpose:
+        tensor = tensor.transpose(0, dim).contiguous()
+
+    redone = _redo_attention_load_balancing(tensor, cp_size, packed_seq_params)
+    s_full = redone.shape[0]
+    s_local = s_full // cp_size
+    out = redone[cp_rank * s_local : (cp_rank + 1) * s_local]
+
+    if need_transpose:
+        out = out.transpose(0, dim).contiguous()
+    return out

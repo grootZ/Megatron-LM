@@ -3,7 +3,7 @@
 import logging
 from collections import OrderedDict
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -49,6 +49,9 @@ from megatron.core.utils import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+
 
 class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
@@ -93,6 +96,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+        mtp_layer_pattern (str, optional): HybridStack pattern for the MTP inner layer.
+        mtp_hybrid_submodules (HybridStackSubmodules, optional): Inner-layer specs for
+            hybrid MTP. Both arguments are passed to MultiTokenPredictionBlock.
         pg_collection (ProcessGroupCollection): Model communication process groups
     """
 
@@ -120,6 +126,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        mtp_layer_pattern: Optional[str] = None,
+        mtp_hybrid_submodules: Optional['HybridStackSubmodules'] = None,
     ) -> None:
         log_single_rank(
             logger,
@@ -251,6 +259,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 spec=self.mtp_block_spec,
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
+                mtp_layer_pattern=mtp_layer_pattern,
+                hybrid_submodules=mtp_hybrid_submodules,
             )
 
             self._setup_mtp_cuda_graphs()
@@ -630,6 +640,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        # Per-layer (hashed n-gram) embeddings need the raw token ids, which the decoder
+        # layers never see: hand them to every PLE module of this stage before the decoder runs.
+        if self.config.ple_layer_ids:
+            self._prepare_per_layer_embeddings(input_ids, packed_seq_params, inference_context)
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -675,6 +690,42 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor_context=output_processor_context,
         )
 
+    def _prepare_per_layer_embeddings(
+        self,
+        input_ids: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        inference_context: Optional[BaseInferenceContext],
+    ) -> None:
+        """Compute the hashed n-gram ids for every PLE module of this pipeline stage.
+
+        The ids are derived from the raw token ids (with the n-gram context reset at
+        ``config.ple_eos_token_id`` and at packed-sequence boundaries) and stashed on the PLE
+        modules, which consume them in their forward pass.
+        """
+        ple_modules = [
+            layer.per_layer_embedding
+            for layer in getattr(self.decoder, "layers", [])
+            if getattr(layer, "per_layer_embedding", None) is not None
+        ]
+        if not ple_modules:
+            return
+        if input_ids is None:
+            raise ValueError(
+                "Per-layer embeddings require `input_ids`; passing only `decoder_input` is not "
+                "supported for models with ple_layer_ids."
+            )
+        if inference_context is not None:
+            raise NotImplementedError(
+                "Per-layer embeddings do not support the Megatron inference path yet."
+            )
+        cu_seqlens = None
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        for module in ple_modules:
+            module.prepare(input_ids, cu_seqlens=cu_seqlens)
+
     def _postprocess(
         self,
         hidden_states,
@@ -698,6 +749,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        mhc_multistream=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -737,6 +789,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 embedding=self.embedding,
                 mtp_input_mask=mtp_input_mask,
+                mhc_multistream=mhc_multistream,
                 **(extra_block_kwargs or {}),
             )
 

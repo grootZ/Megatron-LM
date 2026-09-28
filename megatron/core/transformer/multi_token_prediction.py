@@ -1085,7 +1085,7 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
-    if config.mtp_detach_heads:
+    if getattr(config, "mtp_detach_lm_head", getattr(config, "mtp_detach_heads", False)):
         if output_weight is not None:
             output_weight = output_weight.detach()
         else:
@@ -1443,7 +1443,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        if self.mhc_enabled:
+        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -1538,12 +1538,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
-        if mtp_input_mask is not None:
-            # Keep invalid placeholder values in the forward pass, but prevent
-            # later causal positions from updating their shared embedding rows.
-            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
-            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
-
         # Mirror the scatter in the model's own forward (see hybrid_model.py:
         # "the embedding skips SP scatter for models whose outer wrapper
         # scatters instead"). Multimodal LMs build LanguageModelEmbedding with
@@ -1557,12 +1551,32 @@ class MultiTokenPredictionLayer(MegatronModule):
         ):
             decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
 
-        if self.config.mtp_detach_heads:
+        if mtp_input_mask is not None:
+            # Keep invalid placeholder values in the forward pass, but prevent
+            # later causal positions from updating their shared embedding rows.
+            valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+            if valid_decoder_input.shape[0] != decoder_input.shape[0]:
+                assert self.config.sequence_parallel, (
+                    "MTP conditioning mask and decoder input sequence lengths differ without "
+                    "sequence parallelism"
+                )
+                valid_decoder_input = scatter_to_sequence_parallel_region(
+                    valid_decoder_input, group=self.tp_group
+                )
+            assert valid_decoder_input.shape[0] == decoder_input.shape[0], (
+                f"MTP conditioning mask sequence length {valid_decoder_input.shape[0]} must match "
+                f"decoder input sequence length {decoder_input.shape[0]}"
+            )
+            decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
+
+        if getattr(
+            self.config, "mtp_detach_embedding", getattr(self.config, "mtp_detach_heads", False)
+        ):
             decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
-        # which happens after detach() with mtp_detach_heads. Activation
+        # which happens after detaching the embedding path. Activation
         # checkpointing (CheckpointFunction.apply) requires at least one input tensor
         # with requires_grad=True to produce a differentiable output, so we ensure it
         # here to maintain gradient flow to MTP layer parameters.
@@ -1702,7 +1716,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         Postprocesses the output of the transformer layers.
         """
 
-        if self.mhc_enabled:
+        if self.mhc_enabled and not getattr(self.final_layernorm, 'contracts_mhc_streams', False):
             hidden_states = learned_output_contract(
                 hidden_states,
                 self.hc_head_fn,
@@ -2433,8 +2447,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         else:
             hidden_states = hidden_states_list[offset]
 
-        if self.config.mtp_detach_heads:
-            hidden_states = hidden_states.detach()
+        if offset == 0 and getattr(
+            self.config, "mtp_detach_backbone", getattr(self.config, "mtp_detach_heads", False)
+        ):
+            # A nonzero offset is an output from a preceding MTP pipeline stage,
+            # rather than the main backbone. Keep that path connected so earlier
+            # MTP stages still receive gradients.
+            hidden_states = hidden_states.detach().requires_grad_(True)
 
         hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
         if hidden_state_mixing_enabled:

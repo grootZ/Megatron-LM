@@ -277,6 +277,9 @@ class TransformerLayerSubmodules:
             in the `sharded_state_dict` method.
     """
 
+    per_layer_embedding: Union[ModuleSpec, type] = IdentityOp
+    """Optional module added to the residual streams before the self-attention site
+    (Qwen4-Exp per-layer n-gram embedding). Only consumed by HyperConnectionTransformerLayer."""
     input_layernorm: LayerNormBuilder = IdentityOp
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
@@ -1839,6 +1842,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(
             config=config,
@@ -1847,6 +1854,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            is_mtp_layer=is_mtp_layer,
+            add_layer_offset=add_layer_offset,
+            pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         if submodules.cross_attention_hyper_connection is not IdentityOp:
@@ -1892,6 +1903,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self.mlp_hyper_connection = build_module(
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
+
+        # Optional per-layer embedding (Qwen4-Exp PLE) added to the n-stream residual before
+        # the self-attention hyper connection reads it.
+        self.per_layer_embedding = build_module(
+            submodules.per_layer_embedding, config=self.config, layer_number=self.layer_number
+        )
+        if isinstance(self.per_layer_embedding, IdentityOp):
+            self.per_layer_embedding = None
 
         # When mHC recompute is active, skip checkpointing if the layernorm
         # is IdentityOp (fused into TE linear) — there is nothing to recompute.
@@ -1982,6 +2001,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         skeleton's ``residual`` argument, and ``(h_res, h_post)`` flows via
         ``attn_state``.
         """
+        # Optional per-layer embedding: added to every residual stream before the
+        # self-attention hyper connection reads them.
+        if self.per_layer_embedding is not None:
+            nvtx_range_push(suffix="per_layer_embedding")
+            hidden_states = hidden_states + self.per_layer_embedding(hidden_states)
+            nvtx_range_pop(suffix="per_layer_embedding")
+
         # Capture the n-stream residual BEFORE self_attention_hyper_connection
         # aggregates n-stream -> single-stream. The fused bda kernel needs the
         # original n-stream tensor.
