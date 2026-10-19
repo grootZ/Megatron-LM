@@ -60,7 +60,7 @@ RCP_LN2 = 1.4426950216
 # Hardware capability probes (`fla.utils`).
 # ----------------------------------------------------------------------------
 def _is_nvidia() -> bool:
-    return torch.cuda.is_available() and torch.version.hip is None
+    return torch.cuda.is_available() and torch.cuda.device_count() > 0 and torch.version.hip is None
 
 
 IS_NVIDIA = _is_nvidia()

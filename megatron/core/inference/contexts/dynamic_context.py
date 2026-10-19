@@ -81,7 +81,7 @@ except ImportError:
 try:
     from torch_memory_saver import torch_memory_saver
 
-    torch_memory_saver.hook_mode = "torch"
+    # torch_memory_saver.hook_mode = "torch"
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
